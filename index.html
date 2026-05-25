@@ -448,6 +448,62 @@
       </div>
     </section>
 
+    <!-- Troubleshooting Guidance Modal / Card (Shown dynamically on error) -->
+    <div id="troubleshootModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+      <div class="gradient-border-card max-w-xl w-full p-6 bg-gray-950 border border-gray-800 rounded-3xl space-y-4 shadow-2xl relative">
+        <button id="closeTroubleshootBtn" class="absolute top-4 right-4 text-gray-400 hover:text-white transition-all">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+        <div class="flex items-center gap-3 border-b border-gray-800 pb-3">
+          <i class="fa-solid fa-triangle-exclamation text-red-500 text-2xl animate-pulse"></i>
+          <div>
+            <h3 class="text-base font-extrabold text-white">USB Connection Error</h3>
+            <p id="troubleshootErrorText" class="text-3xs text-red-400 font-mono">Unable to claim interface</p>
+          </div>
+        </div>
+        <p class="text-xs text-gray-400 leading-relaxed">
+          Your browser successfully saw the camera, but the operating system blocked Chrome from opening the device's PTP registers. Let's fix this in 10 seconds:
+        </p>
+        <div class="space-y-3.5 mt-2">
+          <!-- Windows Fix -->
+          <div class="bg-gray-900/60 border border-gray-800 p-3.5 rounded-xl space-y-1.5">
+            <span class="text-3xs font-extrabold text-blue-400 uppercase tracking-widest flex items-center gap-1">
+              <i class="fa-brands fa-windows"></i> Windows users (Most Common)
+            </span>
+            <p class="text-2xs text-gray-400 leading-normal">
+              Windows automatically claims the camera to its default MTP driver. To let the browser access it, we need to bind the camera to standard **WinUSB**:
+            </p>
+            <ol class="list-decimal list-inside text-3xs text-gray-500 space-y-1 pl-1">
+              <li>Download the tiny official utility <a href="https://zadig.akeo.ie/" target="_blank" class="text-red-400 hover:underline">Zadig (https://zadig.akeo.ie/)</a>.</li>
+              <li>Turn your camera on, select **Options** ➔ click **List All Devices** inside Zadig.</li>
+              <li>Select your Canon camera from the dropdown menu.</li>
+              <li>Set the target driver to **WinUSB** and click **Replace Driver** (or Reinstall).</li>
+              <li>Come back here, refresh, and press Connect!</li>
+            </ol>
+          </div>
+          <!-- Mac Fix -->
+          <div class="bg-gray-900/60 border border-gray-800 p-3.5 rounded-xl space-y-1.5">
+            <span class="text-3xs font-extrabold text-emerald-400 uppercase tracking-widest flex items-center gap-1">
+              <i class="fa-brands fa-apple"></i> macOS Users
+            </span>
+            <p class="text-2xs text-gray-400 leading-normal">
+              A background system process called `PTPCamera` automatically locks the USB port on launch.
+            </p>
+            <ol class="list-decimal list-inside text-3xs text-gray-500 space-y-1 pl-1">
+              <li>Open your Mac **Terminal** app.</li>
+              <li>Copy & paste: <code class="bg-black text-red-400 px-1 py-0.5 rounded">killall PTPCamera</code> and hit Enter.</li>
+              <li>Refresh this website page and click Connect!</li>
+            </ol>
+          </div>
+        </div>
+        <div class="pt-2">
+          <button id="closeTroubleshootFooterBtn" class="w-full py-2.5 bg-red-600 hover:bg-red-500 text-white font-bold text-xs rounded-xl transition-all">
+            Got it, Let's Try Again
+          </button>
+        </div>
+      </div>
+    </div>
+
   </main>
 
   <!-- Footer -->
@@ -525,6 +581,24 @@
 
     document.getElementById('clearLogsBtn').addEventListener('click', () => {
       ptpLogArea.innerHTML = '<div class="text-gray-500">// Welcome to the PTP Diagnostics Console. Transactions will appear here in real-time.</div>';
+    });
+
+    // Troubleshooter Modal Handler
+    const troubleshootModal = document.getElementById('troubleshootModal');
+    const troubleshootErrorText = document.getElementById('troubleshootErrorText');
+    
+    function showUsbTroubleshooter(errorMessage) {
+      troubleshootErrorText.textContent = errorMessage || "Connection failed or interface already locked";
+      troubleshootModal.classList.remove('hidden');
+    }
+    
+    const closeBtns = [document.getElementById('closeTroubleshootBtn'), document.getElementById('closeTroubleshootFooterBtn')];
+    closeBtns.forEach(btn => {
+      if (btn) {
+        btn.addEventListener('click', () => {
+          troubleshootModal.classList.add('hidden');
+        });
+      }
     });
 
     // PTP Constant maps
@@ -831,7 +905,6 @@
     // Main action controller to query camera properties
     async function startCameraSession() {
       try {
-        connectionLoader.classList.remove('hidden');
         updateStep('usb', 'pending', 'Initializing USB interface configuration...');
         
         // Dynamic discovery of endpoints
@@ -1055,7 +1128,7 @@
         updateStep('session', 'error', `Connection Interrupted: ${err.message}`);
         setTimeout(() => {
           connectionLoader.classList.add('hidden');
-          alert(`Connection Error: ${err.message}\n\nPlease verify that your camera is in PTP mode, Wi-Fi is disabled, no other program is running, and try unplugging and replugging your USB cable!`);
+          showUsbTroubleshooter(err.message);
         }, 1500);
         disconnectCamera();
       }
@@ -1098,6 +1171,11 @@
         return;
       }
 
+      // Show loader
+      connectionLoader.classList.remove('hidden');
+      connectionSteps.innerHTML = '';
+      updateStep('select', 'pending', 'Requesting USB device selection...');
+
       try {
         logPtp("Requesting USB Device access...");
         connectedDevice = await navigator.usb.requestDevice({
@@ -1106,21 +1184,31 @@
           ]
         });
 
+        updateStep('select', 'success', `Granted access to: ${connectedDevice.productName || 'Canon Camera'}`);
         logPtp(`USB access granted for ${connectedDevice.productName || 'Unknown Device'}`);
-        await connectedDevice.open();
         
-        // Reset device configurations if already loaded
-        await connectedDevice.reset();
+        updateStep('open', 'pending', 'Opening USB device connection...');
+        await connectedDevice.open();
+        updateStep('open', 'success', 'USB device connection opened!');
         
         if (connectedDevice.configuration === null) {
+          updateStep('config', 'pending', 'Selecting device configuration...');
           await connectedDevice.selectConfiguration(1);
+          updateStep('config', 'success', 'Configuration #1 selected.');
         }
 
-        startCameraSession();
+        await startCameraSession();
 
       } catch (err) {
-        logPtp(`USB Selection failed or cancelled: ${err.message}`, 'error');
-        console.warn("Connection cancelled or interface claim failed:", err);
+        logPtp(`USB Selection/Open failed: ${err.message}`, 'error');
+        updateStep('select', 'error', `Failed: ${err.message}`);
+        
+        setTimeout(() => {
+          connectionLoader.classList.add('hidden');
+          showUsbTroubleshooter(err.message);
+        }, 1000);
+        
+        disconnectCamera();
       }
     });
 
@@ -1342,5 +1430,5 @@ Thank you for using the free online EOS Diagnostic tool.
     }
 
   </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0179b103f05265b',t:'MTc3OTc0NDI1Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a017b3a74ffa4cea',t:'MTc3OTc0NTI2MA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
