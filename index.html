@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Canon EOS Shutter Counter & Diagnostics Tool</title>
   
+  <!-- PWA Manifest Link -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#ef4444">
+  
   <!-- Global Error Catching Boundary -->
   <script>
     window.addEventListener('error', function(e) {
@@ -521,6 +525,15 @@
 
   <!-- WebUSB PTP Core Implementation Script -->
   <script>
+    // Register PWA Service Worker (Runs on standalone installs)
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js')
+          .then(reg => console.log('PWA Service Worker registered!', reg))
+          .catch(err => console.log('Service Worker registration failed:', err));
+      });
+    }
+
     // App Mode Toggle
     const usbSection = document.getElementById('usbSection');
     const fileSection = document.getElementById('fileSection');
@@ -694,212 +707,6 @@
         if (lastChar !== 0) str += String.fromCharCode(lastChar);
       }
       return { val: str, len: 1 + numChars * 2 };
-    }
-
-    function parsePtpArray16(view, offset) {
-      if (offset + 4 > view.byteLength) return { val: [], len: 0 };
-      const count = view.getUint32(offset, true);
-      const arr = [];
-      let currentOffset = offset + 4;
-      for (let i = 0; i < count; i++) {
-        if (currentOffset + 2 > view.byteLength) break;
-        arr.push(view.getUint16(currentOffset, true));
-        currentOffset += 2;
-      }
-      return { val: arr, len: 4 + count * 2 };
-    }
-
-    function parseDeviceInfo(buffer) {
-      const view = new DataView(buffer);
-      let offset = 0;
-
-      if (view.byteLength < 8) return null;
-
-      const standardVersion = view.getUint16(offset, true); offset += 2;
-      const vendorExtensionId = view.getUint32(offset, true); offset += 4;
-      const vendorExtensionVersion = view.getUint16(offset, true); offset += 2;
-
-      const vendorDesc = parsePtpString(view, offset); offset += vendorDesc.len;
-      const functionalMode = view.getUint16(offset, true); offset += 2;
-
-      const ops = parsePtpArray16(view, offset); offset += ops.len;
-      const events = parsePtpArray16(view, offset); offset += events.len;
-      const props = parsePtpArray16(view, offset); offset += props.len;
-      const capFormats = parsePtpArray16(view, offset); offset += capFormats.len;
-      const imgFormats = parsePtpArray16(view, offset); offset += imgFormats.len;
-
-      const manufacturer = parsePtpString(view, offset); offset += manufacturer.len;
-      const model = parsePtpString(view, offset); offset += model.len;
-      const devVersion = parsePtpString(view, offset); offset += devVersion.len;
-      const serialNumber = parsePtpString(view, offset); offset += serialNumber.len;
-
-      return {
-        manufacturer: manufacturer.val,
-        model: model.val,
-        deviceVersion: devVersion.val,
-        serialNumber: serialNumber.val,
-        operationsSupported: ops.val,
-        devicePropertiesSupported: props.val
-      };
-    }
-
-    // Raw property interpreter
-    function parsePtpProperty(buffer, dpc) {
-      const view = new DataView(buffer);
-      if (view.byteLength === 0) return "Not Reported";
-
-      // String properties
-      if ([CANON_PROP_SERIAL_NUMBER, CANON_PROP_LENS_NAME, CANON_PROP_OWNER_NAME, CANON_PROP_ARTIST, CANON_PROP_COPYRIGHT].includes(dpc)) {
-        return parsePtpString(view, 0).val || "N/A";
-      }
-
-      // Numeric: Shutter Count
-      if (dpc === CANON_PROP_SHUTTER_COUNT) {
-        if (view.byteLength >= 4) {
-          return view.getUint32(0, true);
-        } else if (view.byteLength >= 2) {
-          return view.getUint16(0, true);
-        }
-      }
-
-      // Battery level or generic numeric values
-      if (view.byteLength === 1) return view.getUint8(0);
-      if (view.byteLength === 2) return view.getUint16(0, true);
-      if (view.byteLength === 4) return view.getUint32(0, true);
-
-      // Raw hex presentation
-      return "0x" + Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-    }
-
-    // Core USB PTP protocol methods
-    async function ptpSendCommand(opCode, params = []) {
-      const numParams = params.length;
-      const length = 12 + numParams * 4;
-      const buffer = new ArrayBuffer(length);
-      const view = new DataView(buffer);
-
-      view.setUint32(0, length, true); // Container Length
-      view.setUint16(4, 1, true);      // Container Type = Command Block
-      view.setUint16(6, opCode, true); // Operation Code
-      
-      const tId = opCode === PTP_OP_OPEN_SESSION ? 0 : transactionId++;
-      view.setUint32(8, tId, true);    // Transaction ID
-
-      for (let i = 0; i < numParams; i++) {
-        view.setUint32(12 + i * 4, params[i], true);
-      }
-
-      const paramHex = params.map(p => '0x' + p.toString(16)).join(', ');
-      logPtp(`TX CMD: 0x${opCode.toString(16).toUpperCase()} (${ptpOpName(opCode)}), Params: [${paramHex}], T_ID: ${tId}`, 'send');
-
-      const result = await connectedDevice.transferOut(bulkOutEndpoint, buffer);
-      if (result.status !== 'ok') {
-        throw new Error(`USB write failure: ${result.status}`);
-      }
-      return tId;
-    }
-
-    async function ptpReadTransaction(expectedTId) {
-      let dataBuffer = null;
-      let responseCode = null;
-      let responseParams = [];
-
-      while (connectedDevice) {
-        const result = await connectedDevice.transferIn(bulkInEndpoint, 1024 * 128); // Read up to 128KB
-        if (result.status !== 'ok') {
-          throw new Error(`USB read failure: ${result.status}`);
-        }
-
-        const view = new DataView(result.data.buffer);
-        if (view.byteLength < 12) {
-          throw new Error(`Received too short packet: ${view.byteLength} bytes`);
-        }
-
-        const length = view.getUint32(0, true);
-        const type = view.getUint16(4, true);
-        const code = view.getUint16(6, true);
-        const packetTId = view.getUint32(8, true);
-
-        if (packetTId !== expectedTId) {
-          console.warn(`Transaction ID mismatch: expected ${expectedTId}, got ${packetTId}`);
-        }
-
-        if (type === 2) {
-          // Data Block
-          logPtp(`RX DATA Block: Length=${length}, T_ID=${packetTId}`, 'receive');
-          
-          let receivedBytes = result.data.byteLength;
-          let chunks = [result.data.buffer.slice(12)];
-
-          while (receivedBytes < length && connectedDevice) {
-            const nextResult = await connectedDevice.transferIn(bulkInEndpoint, 1024 * 128);
-            if (nextResult.status !== 'ok') {
-              throw new Error(`Data transmission interrupted: ${nextResult.status}`);
-            }
-            chunks.push(nextResult.data.buffer);
-            receivedBytes += nextResult.data.byteLength;
-          }
-
-          const totalDataLength = length - 12;
-          const flatBuffer = new Uint8Array(totalDataLength);
-          let offset = 0;
-          for (const chunk of chunks) {
-            flatBuffer.set(new Uint8Array(chunk), offset);
-            offset += chunk.byteLength;
-          }
-          dataBuffer = flatBuffer.buffer;
-
-        } else if (type === 3) {
-          // Response Block
-          responseCode = code;
-          const numResponseParams = (length - 12) / 4;
-          for (let i = 0; i < numResponseParams; i++) {
-            responseParams.push(view.getUint32(12 + i * 4, true));
-          }
-          logPtp(`RX RESP Block: Code=0x${code.toString(16).toUpperCase()} (${ptpRcName(code)}), Params: [${responseParams.join(', ')}], T_ID=${packetTId}`, code === PTP_RC_OK ? 'success' : 'error');
-          break;
-        } else {
-          throw new Error(`Unknown PTP container type received: ${type}`);
-        }
-      }
-
-      return { code: responseCode, data: dataBuffer, params: responseParams };
-    }
-
-    async function ptpExecute(opCode, params = []) {
-      const tId = await ptpSendCommand(opCode, params);
-      const result = await ptpReadTransaction(tId);
-      if (result.code !== PTP_RC_OK) {
-        throw new Error(`PTP Operation 0x${opCode.toString(16).toUpperCase()} returned status code 0x${result.code.toString(16).toUpperCase()}`);
-      }
-      return result;
-    }
-
-    // Name mapper helpers for beautiful logs
-    function ptpOpName(code) {
-      const ops = {
-        0x1001: 'GetDeviceInfo',
-        0x1002: 'OpenSession',
-        0x1003: 'CloseSession',
-        0x1014: 'GetDevicePropDesc',
-        0x1015: 'GetDevicePropValue',
-      };
-      return ops[code] || `OP_0x${code.toString(16)}`;
-    }
-
-    function ptpRcName(code) {
-      const rcs = {
-        0x2001: 'OK',
-        0x2002: 'GeneralError',
-        0x2003: 'SessionNotOpen',
-        0x2004: 'InvalidTransactionID',
-        0x2005: 'OperationNotSupported',
-        0x2006: 'ParameterNotSupported',
-        0x2007: 'DeviceBusy',
-        0x2008: 'TransactionAborted',
-        0x2009: 'TransactionCancelled'
-      };
-      return rcs[code] || `RC_0x${code.toString(16)}`;
     }
 
     // Main action controller to query camera properties
@@ -1132,6 +939,212 @@
         }, 1500);
         disconnectCamera();
       }
+    }
+
+    function parsePtpArray16(view, offset) {
+      if (offset + 4 > view.byteLength) return { val: [], len: 0 };
+      const count = view.getUint32(offset, true);
+      const arr = [];
+      let currentOffset = offset + 4;
+      for (let i = 0; i < count; i++) {
+        if (currentOffset + 2 > view.byteLength) break;
+        arr.push(view.getUint16(currentOffset, true));
+        currentOffset += 2;
+      }
+      return { val: arr, len: 4 + count * 2 };
+    }
+
+    function parseDeviceInfo(buffer) {
+      const view = new DataView(buffer);
+      let offset = 0;
+
+      if (view.byteLength < 8) return null;
+
+      const standardVersion = view.getUint16(offset, true); offset += 2;
+      const vendorExtensionId = view.getUint32(offset, true); offset += 4;
+      const vendorExtensionVersion = view.getUint16(offset, true); offset += 2;
+
+      const vendorDesc = parsePtpString(view, offset); offset += vendorDesc.len;
+      const functionalMode = view.getUint16(offset, true); offset += 2;
+
+      const ops = parsePtpArray16(view, offset); offset += ops.len;
+      const events = parsePtpArray16(view, offset); offset += events.len;
+      const props = parsePtpArray16(view, offset); offset += props.len;
+      const capFormats = parsePtpArray16(view, offset); offset += capFormats.len;
+      const imgFormats = parsePtpArray16(view, offset); offset += imgFormats.len;
+
+      const manufacturer = parsePtpString(view, offset); offset += manufacturer.len;
+      const model = parsePtpString(view, offset); offset += model.len;
+      const devVersion = parsePtpString(view, offset); offset += devVersion.len;
+      const serialNumber = parsePtpString(view, offset); offset += serialNumber.len;
+
+      return {
+        manufacturer: manufacturer.val,
+        model: model.val,
+        deviceVersion: devVersion.val,
+        serialNumber: serialNumber.val,
+        operationsSupported: ops.val,
+        devicePropertiesSupported: props.val
+      };
+    }
+
+    // Raw property interpreter
+    function parsePtpProperty(buffer, dpc) {
+      const view = new DataView(buffer);
+      if (view.byteLength === 0) return "Not Reported";
+
+      // String properties
+      if ([CANON_PROP_SERIAL_NUMBER, CANON_PROP_LENS_NAME, CANON_PROP_OWNER_NAME, CANON_PROP_ARTIST, CANON_PROP_COPYRIGHT].includes(dpc)) {
+        return parsePtpString(view, 0).val || "N/A";
+      }
+
+      // Numeric: Shutter Count
+      if (dpc === CANON_PROP_SHUTTER_COUNT) {
+        if (view.byteLength >= 4) {
+          return view.getUint32(0, true);
+        } else if (view.byteLength >= 2) {
+          return view.getUint16(0, true);
+        }
+      }
+
+      // Battery level or generic numeric values
+      if (view.byteLength === 1) return view.getUint8(0);
+      if (view.byteLength === 2) return view.getUint16(0, true);
+      if (view.byteLength === 4) return view.getUint32(0, true);
+
+      // Raw hex presentation
+      return "0x" + Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // Core USB PTP protocol methods
+    async function ptpSendCommand(opCode, params = []) {
+      const numParams = params.length;
+      const length = 12 + numParams * 4;
+      const buffer = new ArrayBuffer(length);
+      const view = new DataView(buffer);
+
+      view.setUint32(0, length, true); // Container Length
+      view.setUint16(4, 1, true);      // Container Type = Command Block
+      view.setUint16(6, opCode, true); // Operation Code
+      
+      const tId = opCode === PTP_OP_OPEN_SESSION ? 0 : transactionId++;
+      view.setUint32(8, tId, true);    // Transaction ID
+
+      for (let i = 0; i < numParams; i++) {
+        view.setUint32(12 + i * 4, params[i], true);
+      }
+
+      const paramHex = params.map(p => '0x' + p.toString(16)).join(', ');
+      logPtp(`TX CMD: 0x${opCode.toString(16).toUpperCase()} (${ptpOpName(opCode)}), Params: [${paramHex}], T_ID: ${tId}`, 'send');
+
+      const result = await connectedDevice.transferOut(bulkOutEndpoint, buffer);
+      if (result.status !== 'ok') {
+        throw new Error(`USB write failure: ${result.status}`);
+      }
+      return tId;
+    }
+
+    async function ptpReadTransaction(expectedTId) {
+      let dataBuffer = null;
+      let responseCode = null;
+      let responseParams = [];
+
+      while (connectedDevice) {
+        const result = await connectedDevice.transferIn(bulkInEndpoint, 1024 * 128); // Read up to 128KB
+        if (result.status !== 'ok') {
+          throw new Error(`USB read failure: ${result.status}`);
+        }
+
+        const view = new DataView(result.data.buffer);
+        if (view.byteLength < 12) {
+          throw new Error(`Received too short packet: ${view.byteLength} bytes`);
+        }
+
+        const length = view.getUint32(0, true);
+        const type = view.getUint16(4, true);
+        const code = view.getUint16(6, true);
+        const packetTId = view.getUint32(8, true);
+
+        if (packetTId !== expectedTId) {
+          console.warn(`Transaction ID mismatch: expected ${expectedTId}, got ${packetTId}`);
+        }
+
+        if (type === 2) {
+          // Data Block
+          logPtp(`RX DATA Block: Length=${length}, T_ID=${packetTId}`, 'receive');
+          
+          let receivedBytes = result.data.byteLength;
+          let chunks = [result.data.buffer.slice(12)];
+
+          while (receivedBytes < length && connectedDevice) {
+            const nextResult = await connectedDevice.transferIn(bulkInEndpoint, 1024 * 128);
+            if (nextResult.status !== 'ok') {
+              throw new Error(`Data transmission interrupted: ${nextResult.status}`);
+            }
+            chunks.push(nextResult.data.buffer);
+            receivedBytes += nextResult.data.byteLength;
+          }
+
+          const totalDataLength = length - 12;
+          const flatBuffer = new Uint8Array(totalDataLength);
+          let offset = 0;
+          for (const chunk of chunks) {
+            flatBuffer.set(new Uint8Array(chunk), offset);
+            offset += chunk.byteLength;
+          }
+          dataBuffer = flatBuffer.buffer;
+
+        } else if (type === 3) {
+          // Response Block
+          responseCode = code;
+          const numResponseParams = (length - 12) / 4;
+          for (let i = 0; i < numResponseParams; i++) {
+            responseParams.push(view.getUint32(12 + i * 4, true));
+          }
+          logPtp(`RX RESP Block: Code=0x${code.toString(16).toUpperCase()} (${ptpRcName(code)}), Params: [${responseParams.join(', ')}], T_ID=${packetTId}`, code === PTP_RC_OK ? 'success' : 'error');
+          break;
+        } else {
+          throw new Error(`Unknown PTP container type received: ${type}`);
+        }
+      }
+
+      return { code: responseCode, data: dataBuffer, params: responseParams };
+    }
+
+    async function ptpExecute(opCode, params = []) {
+      const tId = await ptpSendCommand(opCode, params);
+      const result = await ptpReadTransaction(tId);
+      if (result.code !== PTP_RC_OK) {
+        throw new Error(`PTP Operation 0x${opCode.toString(16).toUpperCase()} returned status code 0x${result.code.toString(16).toUpperCase()}`);
+      }
+      return result;
+    }
+
+    // Name mapper helpers for beautiful logs
+    function ptpOpName(code) {
+      const ops = {
+        0x1001: 'GetDeviceInfo',
+        0x1002: 'OpenSession',
+        0x1003: 'CloseSession',
+        0x1014: 'GetDevicePropDesc',
+        0x1015: 'GetDevicePropValue',
+      };
+      return ops[code] || `OP_0x${code.toString(16)}`;
+    }
+
+    function ptpRcName(code) {
+      const rcs = {
+        0x2001: 'OK',
+        0x2002: 'GeneralError',
+        0x2003: 'SessionNotOpen',
+        0x2004: 'InvalidTransactionID',
+        0x2005: 'OperationNotSupported',
+        0x2006: 'ParameterNotSupported',
+        0x2007: 'DeviceBusy',
+        0x2008: 'TransactionAborted',
+        0x2009: 'TransactionCancelled'
+      };
+      return rcs[code] || `RC_0x${code.toString(16)}`;
     }
 
     async function disconnectCamera() {
@@ -1430,5 +1443,5 @@ Thank you for using the free online EOS Diagnostic tool.
     }
 
   </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a017b3a74ffa4cea',t:'MTc3OTc0NTI2MA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
